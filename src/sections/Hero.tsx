@@ -1,3 +1,4 @@
+import React, { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 
 type CellType = 'empty' | 'pc' | 'desk2' | 'desk3x5' | 'reception' | 'wall'
@@ -82,6 +83,14 @@ const splitRooms = (grid: Cell[][]) => {
 }
 
 const Hero = () => {
+  const [windowWidth, setWindowWidth] = useState(typeof window !== 'undefined' ? window.innerWidth : 768)
+  
+  useEffect(() => {
+    const handleResize = () => setWindowWidth(window.innerWidth)
+    window.addEventListener('resize', handleResize)
+    return () => window.removeEventListener('resize', handleResize)
+  }, [])
+
   const rooms = splitRooms(loadGrid())
 
   return (
@@ -109,7 +118,7 @@ const Hero = () => {
               <span className="screen__label">Mapa de equipos</span>
               <div className="legend">
                 <span className="dot free" /> Disponible
-                <span className="dot busy" /> Ocupado
+                <span className="dot busy muted" /> Bloque
               </div>
             </div>
             <div className="mini-rooms">
@@ -121,8 +130,8 @@ const Hero = () => {
                     <div
                       className="mini-room__grid preview-grid"
                       style={{
-                        gridTemplateColumns: `repeat(${colsRoom}, 12px)`,
-                        gridAutoRows: '12px',
+                        gridTemplateColumns: `repeat(${Math.min(colsRoom, windowWidth < 768 ? 6 : colsRoom)}, ${windowWidth < 768 ? '11px' : '12px'})`,
+                        gridAutoRows: windowWidth < 768 ? '11px' : '12px',
                       }}
                     >
                       {room.layout.flatMap((row, rIdx) =>

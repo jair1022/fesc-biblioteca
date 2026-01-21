@@ -1,14 +1,30 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { FaLaptop, FaTable, FaEraser } from 'react-icons/fa'
 import { MdTableRestaurant, MdRoomService } from 'react-icons/md'
 
 type CellType = 'empty' | 'pc' | 'desk2' | 'desk3x5' | 'reception' | 'wall'
 type Cell = { type: CellType; stamp?: string; w?: number; h?: number; head?: boolean }
+type RoomKey = 'sala1' | 'sala2'
+type RoomStatus = Record<RoomKey, { disabled: boolean; reservedBy?: string | null }>
+type LayoutVersion = { id: string; savedAt: string }
+type ReservationRequest = {
+  id: string
+  status: 'pending' | 'active'
+  code: string
+  seatRow: number
+  seatCol: number
+  requestedAt: string
+  roomKey: string
+  roomName: string
+  userName: string | null
+  userEmail: string
+}
 
 const rows = 10
 const cols = 24
 const wallCol = 12
 const STORAGE_KEY = 'layout-grid-v1'
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 
 const footprints: Record<Exclude<CellType, 'wall' | 'empty'>, { w: number; h: number }> = {
   pc: { w: 1, h: 1 },
@@ -40,6 +56,24 @@ const normalizeGrid = (grid: Cell[][]): Cell[][] => {
     }),
   )
 }
+
+const defaultRoomStatus: RoomStatus = {
+  sala1: { disabled: false, reservedBy: null },
+  sala2: { disabled: false, reservedBy: null },
+}
+
+const formatTime = (value: Date) =>
+  value.toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })
+
+const formatDateTime = (value: string) =>
+  new Date(value).toLocaleString('es-CO', {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+
+const getToken = () => localStorage.getItem('fesc-token') || ''
 
 const loadGrid = (): Cell[][] => {
   try {
@@ -81,6 +115,29 @@ const AdminPage = () => {
   const [grid, setGrid] = useState<Cell[][]>(loadGrid)
   const [tool, setTool] = useState<CellType>('pc')
   const [isDragging, setIsDragging] = useState(false)
+  const [roomStatus, setRoomStatus] = useState<RoomStatus>(defaultRoomStatus)
+  const [reservedNames, setReservedNames] = useState<Record<RoomKey, string>>({
+    sala1: '',
+    sala2: '',
+  })
+  const [layoutLoading, setLayoutLoading] = useState(false)
+  const [layoutSaving, setLayoutSaving] = useState(false)
+  const [layoutError, setLayoutError] = useState('')
+  const [layoutMessage, setLayoutMessage] = useState('')
+  const [lastSavedAt, setLastSavedAt] = useState('')
+  const [versions, setVersions] = useState<LayoutVersion[]>([])
+  const [selectedVersionId, setSelectedVersionId] = useState('')
+  const [versionLoading, setVersionLoading] = useState(false)
+  const [versionError, setVersionError] = useState('')
+  const [requests, setRequests] = useState<ReservationRequest[]>([])
+  const [requestsLoading, setRequestsLoading] = useState(false)
+  const [requestsError, setRequestsError] = useState('')
+  const [requestsMessage, setRequestsMessage] = useState('')
+  const [validationCodes, setValidationCodes] = useState<Record<string, string>>({})
+  const [roomLoading, setRoomLoading] = useState(false)
+  const [roomError, setRoomError] = useState('')
+  const skipAutoSaveRef = useRef(true)
+  const autoSaveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const stats = useMemo(() => {
     let pcs = 0
@@ -159,8 +216,335 @@ const AdminPage = () => {
 
   const resetGrid = () => setGrid(buildInitialGrid())
 
+  const fetchLayout = async () => {
+    setLayoutError('')
+    setLayoutMessage('')
+    setLayoutLoading(true)
+    try {
+      const response = await fetch(`${API_URL}/layout/grid`)
+      const data = await response.json()
+      if (!response.ok) {
+        setLayoutError(data.message || 'No se pudo cargar el tablero.')
+        return
+      }
+      const cells = data.grid?.cells
+      if (!Array.isArray(cells)) {
+        setLayoutError('No se pudo cargar el tablero.')
+        return
+      }
+      const cloned = cells.map((row: Cell[]) =>
+        row.map((cell) => ({
+          type: cell.type,
+          stamp: cell.stamp,
+          w: cell.w,
+          h: cell.h,
+          head: cell.head,
+        })),
+      )
+      const normalized = normalizeGrid(cloned)
+      skipAutoSaveRef.current = true
+      setGrid(normalized)
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ grid: normalized, rows, cols, wallCol }))
+    } catch {
+      setLayoutError('No se pudo conectar con el servidor.')
+    } finally {
+      setLayoutLoading(false)
+    }
+  }
+
+  const fetchRequests = async () => {
+    setRequestsError('')
+    setRequestsMessage('')
+    setRequestsLoading(true)
+    const token = getToken()
+    if (!token) {
+      setRequestsError('Debes iniciar sesión para ver solicitudes.')
+      setRequestsLoading(false)
+      return
+    }
+    try {
+      const response = await fetch(`${API_URL}/reservations/requests`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        setRequestsError(data.message || 'No se pudieron cargar las solicitudes.')
+        return
+      }
+      setRequests(data.requests || [])
+      setValidationCodes((prev) => {
+        const next = { ...prev }
+        ;(data.requests || []).forEach((request: ReservationRequest) => {
+          if (!next[request.id]) next[request.id] = ''
+        })
+        return next
+      })
+    } catch {
+      setRequestsError('No se pudo conectar con el servidor.')
+    } finally {
+      setRequestsLoading(false)
+    }
+  }
+
+  const handleValidateRequest = async (request: ReservationRequest) => {
+    const token = getToken()
+    if (!token) {
+      setRequestsError('Debes iniciar sesión para validar.')
+      return
+    }
+    const code = (validationCodes[request.id] || '').trim().toUpperCase()
+    if (!code) {
+      setRequestsError('Ingresa el código del estudiante.')
+      return
+    }
+    setRequestsLoading(true)
+    setRequestsError('')
+    setRequestsMessage('')
+    try {
+      const response = await fetch(`${API_URL}/reservations/${request.id}/validate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ code }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        setRequestsError(data.message || 'No se pudo validar la reserva.')
+        return
+      }
+      setRequestsMessage('Reserva validada. Puede ingresar al PC.')
+      await fetchRequests()
+    } catch {
+      setRequestsError('No se pudo conectar con el servidor.')
+    } finally {
+      setRequestsLoading(false)
+    }
+  }
+
+  const handleReleaseRequest = async (request: ReservationRequest) => {
+    const token = getToken()
+    if (!token) {
+      setRequestsError('Debes iniciar sesión para liberar.')
+      return
+    }
+    setRequestsLoading(true)
+    setRequestsError('')
+    setRequestsMessage('')
+    try {
+      const response = await fetch(`${API_URL}/reservations/${request.id}/release`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        setRequestsError(data.message || 'No se pudo liberar el PC.')
+        return
+      }
+      setRequestsMessage('Equipo liberado y registro guardado.')
+      await fetchRequests()
+    } catch {
+      setRequestsError('No se pudo conectar con el servidor.')
+    } finally {
+      setRequestsLoading(false)
+    }
+  }
+
+  const fetchVersions = async () => {
+    setVersionError('')
+    setVersionLoading(true)
+    try {
+      const response = await fetch(`${API_URL}/layout/versions`)
+      const data = await response.json()
+      if (!response.ok) {
+        setVersionError(data.message || 'No se pudo cargar el historial.')
+        return
+      }
+      setVersions(data.versions || [])
+    } catch {
+      setVersionError('No se pudo conectar con el servidor.')
+    } finally {
+      setVersionLoading(false)
+    }
+  }
+
+  const saveLayout = async (options?: {
+    grid?: Cell[][]
+    silent?: boolean
+    refreshVersions?: boolean
+    saveVersion?: boolean
+  }) => {
+    if (!options?.silent) {
+      setLayoutError('')
+      setLayoutMessage('')
+    }
+    setLayoutSaving(true)
+    try {
+      const targetGrid = options?.grid ?? grid
+      const response = await fetch(`${API_URL}/layout/grid`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grid: targetGrid,
+          rows,
+          cols,
+          wallCol,
+          saveVersion: options?.saveVersion === true,
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        setLayoutError(data.message || 'No se pudo guardar el tablero.')
+        return
+      }
+      setLastSavedAt(formatTime(new Date()))
+      if (!options?.silent) {
+        setLayoutMessage(data.message || 'Tablero guardado.')
+      }
+      if (options?.refreshVersions) {
+        await fetchVersions()
+      }
+    } catch {
+      setLayoutError('No se pudo conectar con el servidor.')
+    } finally {
+      setLayoutSaving(false)
+    }
+  }
+
+  const restoreVersion = async () => {
+    if (!selectedVersionId) return
+    setVersionError('')
+    setVersionLoading(true)
+    try {
+      const response = await fetch(`${API_URL}/layout/versions/${selectedVersionId}`)
+      const data = await response.json()
+      if (!response.ok) {
+        setVersionError(data.message || 'No se pudo cargar la versión.')
+        return
+      }
+      const snapshot = data.snapshot
+      if (!snapshot?.grid) {
+        setVersionError('No se pudo cargar la versión.')
+        return
+      }
+      const cloned = snapshot.grid.map((row: Cell[]) =>
+        row.map((cell) => ({
+          type: cell.type,
+          stamp: cell.stamp,
+          w: cell.w,
+          h: cell.h,
+          head: cell.head,
+        })),
+      )
+      const normalized = normalizeGrid(cloned)
+      skipAutoSaveRef.current = true
+      setGrid(normalized)
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ grid: normalized, rows, cols, wallCol }))
+      await saveLayout({ grid: normalized, refreshVersions: true, saveVersion: false })
+    } catch {
+      setVersionError('No se pudo conectar con el servidor.')
+    } finally {
+      setVersionLoading(false)
+    }
+  }
+
+  const fetchRoomStatus = async () => {
+    setRoomError('')
+    setRoomLoading(true)
+    try {
+      const response = await fetch(`${API_URL}/rooms/status`)
+      const data = await response.json()
+      if (!response.ok) {
+        setRoomError(data.message || 'No se pudo cargar el estado de salas.')
+        return
+      }
+      const rooms = data.rooms || defaultRoomStatus
+      setRoomStatus(rooms)
+      setReservedNames({
+        sala1: rooms.sala1?.reservedBy || '',
+        sala2: rooms.sala2?.reservedBy || '',
+      })
+    } catch {
+      setRoomError('No se pudo conectar con el servidor.')
+    } finally {
+      setRoomLoading(false)
+    }
+  }
+
+  const updateRoomStatus = async (key: RoomKey, disabled: boolean, reservedBy: string) => {
+    setRoomError('')
+    const nextReserved = disabled ? reservedBy.trim() || null : null
+    setRoomStatus((prev) => ({
+      ...prev,
+      [key]: {
+        disabled,
+        reservedBy: nextReserved,
+      },
+    }))
+    setRoomLoading(true)
+    try {
+      const response = await fetch(`${API_URL}/rooms/${key}/status`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disabled, reservedBy }),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        setRoomError(data.message || 'No se pudo actualizar la sala.')
+        await fetchRoomStatus()
+        return
+      }
+      if (data.room) {
+        setReservedNames((prev) => ({
+          ...prev,
+          [key]: data.room.reservedBy || '',
+        }))
+      }
+    } catch {
+      setRoomError('No se pudo conectar con el servidor.')
+      await fetchRoomStatus()
+    } finally {
+      setRoomLoading(false)
+    }
+  }
+
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ grid, rows, cols, wallCol }))
+  }, [grid])
+
+  useEffect(() => {
+    fetchRoomStatus()
+  }, [])
+
+  useEffect(() => {
+    fetchLayout()
+  }, [])
+
+  useEffect(() => {
+    fetchVersions()
+  }, [])
+
+  useEffect(() => {
+    fetchRequests()
+  }, [])
+
+  useEffect(() => {
+    if (skipAutoSaveRef.current) {
+      skipAutoSaveRef.current = false
+      return
+    }
+    if (autoSaveTimeoutRef.current) {
+      clearTimeout(autoSaveTimeoutRef.current)
+    }
+    autoSaveTimeoutRef.current = setTimeout(() => {
+      saveLayout({ silent: true, saveVersion: false })
+    }, 900)
+    return () => {
+      if (autoSaveTimeoutRef.current) {
+        clearTimeout(autoSaveTimeoutRef.current)
+      }
+    }
   }, [grid])
 
   return (
@@ -178,8 +562,75 @@ const AdminPage = () => {
           <button className="btn ghost small" onClick={resetGrid}>
             Limpiar cuadrícula
           </button>
+          <button
+            className="btn primary small"
+            onClick={() => saveLayout({ refreshVersions: true, saveVersion: true })}
+            disabled={layoutSaving || layoutLoading}
+          >
+            {layoutSaving ? 'Guardando...' : 'Guardar tablero'}
+          </button>
         </div>
+        <p className="form-message">
+          Autoguardado activo{lastSavedAt ? ` • Último guardado ${lastSavedAt}` : ''}
+        </p>
+        {layoutMessage && <p className="form-message">{layoutMessage}</p>}
+        {layoutError && <p className="form-message error">{layoutError}</p>}
       </header>
+      
+      <div className="admin-palette-card">
+        <div className="header-copy">
+          <p className="eyebrow">Control de salas</p>
+          <p className="lead">Inhabilitar sala y asignar reserva</p>
+        </div>
+        <div className="palette palette-grid">
+          {(['sala1', 'sala2'] as RoomKey[]).map((key) => {
+            const status = roomStatus[key]
+            const reservedValue = reservedNames[key] || ''
+            return (
+              <div key={key} className="room-control">
+                <label className="toggle-label">
+                  <input
+                    type="checkbox"
+                    checked={status?.disabled || false}
+                    onChange={() => updateRoomStatus(key, !status?.disabled, reservedValue)}
+                    disabled={roomLoading}
+                  />
+                  <span className="toggle-slider"></span>
+                  <span>{`Inhabilitar ${key === 'sala1' ? 'Sala 1' : 'Sala 2'}`}</span>
+                </label>
+                {status?.disabled && (
+                  <div className="reservation-input">
+                    <input
+                      type="text"
+                      placeholder="Nombre de quien reserva"
+                      value={reservedValue}
+                      onChange={(event) =>
+                        setReservedNames((prev) => ({ ...prev, [key]: event.target.value }))
+                      }
+                      className="input-field"
+                    />
+                    <button
+                      className="btn primary small"
+                      onClick={() => updateRoomStatus(key, true, reservedValue)}
+                      disabled={roomLoading}
+                    >
+                      Guardar nombre
+                    </button>
+                  </div>
+                )}
+                {status?.disabled && status?.reservedBy && (
+                  <div className="reservation-info">
+                    <p>
+                      <strong>Reservada por:</strong> {status.reservedBy}
+                    </p>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+        {roomError && <p className="form-message error">{roomError}</p>}
+      </div>
       <div className="admin-palette-card">
         <div className="header-copy">
           <p className="eyebrow">Herramientas</p>
@@ -206,12 +657,115 @@ const AdminPage = () => {
           ))}
         </div>
       </div>
+      <div className="admin-palette-card">
+        <div className="header-copy">
+          <p className="eyebrow">Solicitudes</p>
+          <p className="lead">Valida códigos y libera PCs al finalizar</p>
+        </div>
+        <div className="history-actions">
+          <button className="btn ghost small" onClick={fetchRequests} disabled={requestsLoading}>
+            {requestsLoading ? 'Cargando...' : 'Actualizar solicitudes'}
+          </button>
+        </div>
+        {requestsError && <p className="form-message error">{requestsError}</p>}
+        {requestsMessage && <p className="form-message success">{requestsMessage}</p>}
+        <div className="reservations-list">
+          {requests.length === 0 && !requestsLoading && (
+            <p className="form-message">Sin solicitudes activas.</p>
+          )}
+          {requests.map((request) => (
+            <article key={request.id} className="card reservation-card">
+              <div className="reservation-card-head">
+                <div>
+                  <h3>{request.roomName}</h3>
+                  <p className="lead">
+                    {request.userName || request.userEmail} · PC F{request.seatRow + 1}-E
+                    {request.seatCol + 1}
+                  </p>
+                  <p className="muted">Solicitada: {formatDateTime(request.requestedAt)}</p>
+                  <p className="muted">Código generado: {request.code}</p>
+                </div>
+                <span className={`badge ${request.status}`}>
+                  {request.status === 'pending' ? 'Pendiente' : 'Activa'}
+                </span>
+              </div>
+              <div className="reservation-card-body">
+                <label className="field inline">
+                  <span>Código</span>
+                  <input
+                    type="text"
+                    className="input-field"
+                    placeholder="ABC123"
+                    value={validationCodes[request.id] || ''}
+                    onChange={(event) =>
+                      setValidationCodes((prev) => ({ ...prev, [request.id]: event.target.value }))
+                    }
+                  />
+                </label>
+                <div className="history-actions">
+                  {request.status === 'pending' && (
+                    <button
+                      className="btn primary small"
+                      onClick={() => handleValidateRequest(request)}
+                      disabled={requestsLoading}
+                    >
+                      Validar ingreso
+                    </button>
+                  )}
+                  {request.status === 'active' && (
+                    <button
+                      className="btn ghost small"
+                      onClick={() => handleReleaseRequest(request)}
+                      disabled={requestsLoading}
+                    >
+                      Liberar PC
+                    </button>
+                  )}
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+      </div>
+      <div className="admin-palette-card">
+        <div className="header-copy">
+          <p className="eyebrow">Historial</p>
+          <p className="lead">Restaura versiones anteriores del tablero</p>
+        </div>
+        <div className="reservation-input history-panel">
+          <select
+            className="input-field"
+            value={selectedVersionId}
+            onChange={(event) => setSelectedVersionId(event.target.value)}
+          >
+            <option value="">Selecciona una versión</option>
+            {versions.map((version) => (
+              <option key={version.id} value={version.id}>
+                {new Date(version.savedAt).toLocaleString('es-CO')}
+              </option>
+            ))}
+          </select>
+          <div className="history-actions">
+            <button className="btn ghost small" onClick={fetchVersions} disabled={versionLoading}>
+              {versionLoading ? 'Actualizando...' : 'Actualizar historial'}
+            </button>
+            <button
+              className="btn primary small"
+              onClick={restoreVersion}
+              disabled={!selectedVersionId || versionLoading}
+            >
+              Restaurar versión
+            </button>
+          </div>
+        </div>
+        {versionError && <p className="form-message error">{versionError}</p>}
+      </div>
 
       <div
         className="builder-grid"
         onMouseLeave={() => setIsDragging(false)}
         onMouseUp={() => setIsDragging(false)}
-        style={{ gridTemplateColumns: `repeat(${cols}, minmax(16px, 1fr))` }}
+        style={{ gridTemplateColumns: `repeat(${cols}, minmax(32px, 1fr))` }}
       >
         {grid.flatMap((row, rIdx) =>
           row.map((cell, cIdx) => {
